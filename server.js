@@ -9,30 +9,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 8080;
-// на Railway лучше так, чтобы переживало рестарты
 const TASK_DIR = process.env.TASK_DIR || "/mnt/data/tasks";
 fs.mkdirSync(TASK_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-app.get("/", (_, res) => res.json({ ok: true, msg: "Avito webhook alive" }));
+// healthcheck
+app.get("/", (_, res) => res.json({ ok: true, msg: "Avito webhook alive 🚀" }));
 
-// один проект для многих аккаунтов: /webhook/:account
+// основной вебхук
 app.post("/webhook/:account", (req, res) => {
   const account = req.params.account || "default";
   const body = req.body || {};
 
-  // ждём формат v3 из твоего примера
   const p = body.payload?.value;
   if (body.payload?.type !== "message" || !p) {
     return res.json({ ok: true, skipped: "not a message event" });
   }
-  // отрезаем системные сообщения
+
+  // системные сообщения (резюме и прочее) игнорируем
   const isSystem =
     String(p.type || "").toLowerCase() === "system" ||
     (p.content?.text || "").startsWith("[Системное сообщение]");
-
   if (isSystem) return res.json({ ok: true, skipped: "system message" });
 
   const authorId = Number(p.author_id || 0);
@@ -64,8 +63,7 @@ app.post("/webhook/:account", (req, res) => {
 
   const filePath = path.join(TASK_DIR, `${messageId}.json`);
   try {
-    // идемпотентно: создаём только если файла ещё нет
-    const fd = fs.openSync(filePath, "wx");
+    const fd = fs.openSync(filePath, "wx"); // создать новый файл, если нет
     fs.writeFileSync(fd, JSON.stringify(task, null, 2), "utf8");
     fs.closeSync(fd);
   } catch (e) {
@@ -75,6 +73,62 @@ app.post("/webhook/:account", (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+// === Debug routes for tasks ===
+
+// список задач
+app.get("/tasks/list", (req, res) => {
+  try {
+    const files = fs.readdirSync(TASK_DIR)
+      .filter(f => f.endsWith(".json"))
+      .map(f => {
+        const p = path.join(TASK_DIR, f);
+        const st = fs.statSync(p);
+        return {
+          id: f.replace(/\.json$/, ""),
+          file: f,
+          size: st.size,
+          mtime: st.mtime.toISOString()
+        };
+      })
+      .sort((a, b) => b.mtime.localeCompare(a.mtime));
+    res.json({ ok: true, dir: TASK_DIR, count: files.length, files });
+  } catch (e) {
+    console.error("list error:", e);
+    res.status(500).json({ ok: false, error: "list failed" });
+  }
+});
+
+// чтение конкретной задачи
+app.get("/tasks/read/:id", (req, res) => {
+  const id = (req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, error: "no id" });
+  const filePath = path.join(TASK_DIR, `${id}.json`);
+  try {
+    if (!fs.existsSync(filePath)) return res.status(404).json({ ok: false, error: "not found" });
+    const data = fs.readFileSync(filePath, "utf8");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.send(data);
+  } catch (e) {
+    console.error("read error:", e);
+    res.status(500).json({ ok: false, error: "read failed" });
+  }
+});
+
+// подчистить все задачи
+app.post("/tasks/purge", (req, res) => {
+  try {
+    const files = fs.readdirSync(TASK_DIR).filter(f => f.endsWith(".json"));
+    let removed = 0;
+    for (const f of files) {
+      try { fs.unlinkSync(path.join(TASK_DIR, f)); removed++; } catch {}
+    }
+    res.json({ ok: true, removed });
+  } catch (e) {
+    console.error("purge error:", e);
+    res.status(500).json({ ok: false, error: "purge failed" });
+  }
 });
 
 app.listen(PORT, () => console.log(`Webhook listening on :${PORT}`));
