@@ -21,14 +21,20 @@ app.get("/", (_, res) => res.json({ ok: true, msg: "Avito webhook alive 🚀" })
 // основной вебхук
 app.post("/webhook/:account", (req, res) => {
   const account = req.params.account || "default";
-  const body = req.body || {};
 
+  // >>> Выводим полный JSON в логи Railway
+  console.log("=== RAW AVITO WEBHOOK ===");
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log("=========================");
+
+  const body = req.body || {};
   const p = body.payload?.value;
+
   if (body.payload?.type !== "message" || !p) {
     return res.json({ ok: true, skipped: "not a message event" });
   }
 
-  // системные сообщения (резюме и прочее) игнорируем
+  // системные сообщения игнорируем
   const isSystem =
     String(p.type || "").toLowerCase() === "system" ||
     (p.content?.text || "").startsWith("[Системное сообщение]");
