@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 // === Конфиг из env
 const PORT = process.env.PORT || 8080;
 const TASK_DIR = process.env.TASK_DIR || "/mnt/data/tasks";         // файловая очередь
-const TASK_KEY = process.env.TASK_KEY || "super_secret_task_key";   // ключ для claim/done/requeue
+const TASK_KEY = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN_super_secret";   // ключ для claim/done/requeue
 const DEFAULT_REPLY =
   process.env.DEFAULT_REPLY ||
   "Здравствуйте! Спасибо за отклик 🙌 Сейчас пришлю детали и анкету.";
