@@ -1,4 +1,4 @@
-// server.js — ESM версия (package.json должен содержать: "type": "module")
+// server.js — ESM (в package.json: { "type": "module" })
 import express from 'express';
 import fs from 'fs';
 import { promises as fsp } from 'fs';
@@ -11,14 +11,15 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-// ===== ENV =====
+// ===== ENV / CONFIG =====
 const PORT              = Number(process.env.PORT || 3000);
-const TASK_KEY = "kK9f4JQ7uX2pL0aN"; // твой ключ прямо в коде
+const TASK_KEY          = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN"; // можно вынести в env
 const LOG_DIR           = process.env.LOG_DIR  || '/mnt/data/logs';
 const TASK_DIR          = process.env.TASK_DIR || '/mnt/data/tasks';
 const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
 const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
 const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '';
+const LOG_TAIL_BYTES    = Number(process.env.LOG_TAIL_BYTES || 512 * 1024); // сколько байт читать из конца файла
 
 // ===== helpers =====
 async function ensureDir(dir) { try { await fsp.mkdir(dir, { recursive: true }); } catch {} }
@@ -46,9 +47,9 @@ function ok(res, extra = {}) { return res.send({ ok: true, ...extra }); }
 function bad(res, code, msg) { return res.status(code).send({ ok: false, error: msg }); }
 
 // ===== FILE QUEUE =====
-// файл задачи: { id, account, chat_id, reply_text, message_id, created_at }
+// структура задачи в файле: { id, account, chat_id, reply_text, [author_id?], [message_id?], created_at }
 
-async function createTask({ account, chat_id, reply_text, message_id }) {
+async function createTask({ account, chat_id, reply_text, message_id, author_id }) {
   await ensureDir(TASK_DIR);
   const id  = genId();
   const acc = (account || 'hr-main').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -59,6 +60,7 @@ async function createTask({ account, chat_id, reply_text, message_id }) {
     chat_id,
     reply_text: reply_text || DEFAULT_REPLY,
     message_id: message_id || null,
+    author_id: author_id || null, // если знаешь своего author заранее — можно проставлять
     created_at: nowIso(),
   };
 
@@ -116,6 +118,63 @@ async function requeueTask(lockId) {
   return true;
 }
 
+// ===== LOG HELPERS =====
+// пути двух последних .log по mtime
+async function getTwoLatestLogFiles() {
+  await ensureDir(LOG_DIR);
+  const files = (await fsp.readdir(LOG_DIR))
+    .filter(f => f.endsWith('.log'))
+    .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs }))
+    .sort((a, b) => b.t - a.t)
+    .slice(0, 2)
+    .map(x => path.join(LOG_DIR, x.f));
+  return files;
+}
+
+// прочитать хвост лог-файла
+async function readLogTail(file, maxBytes = LOG_TAIL_BYTES) {
+  let buf = await fsp.readFile(file, 'utf8');
+  if (buf.length > maxBytes) buf = buf.slice(buf.length - maxBytes);
+  return buf;
+}
+
+// «умный» матч: сначала пробуем JSON, иначе — по распространённым текстовым шаблонам
+function isLogMatch(line, chatId, authorId) {
+  // Попытка JSON-строки
+  if (line && (line[0] === '{' || line[0] === '[')) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj && typeof obj === 'object') {
+        const lChat = obj.chat_id ?? obj.chatId ?? obj.chat ?? null;
+        const lAuth = obj.author_id ?? obj.authorId ?? obj.author ?? null;
+        if (lChat != null && lAuth != null) {
+          return String(lChat) === String(chatId) && String(lAuth) === String(authorId);
+        }
+      }
+    } catch { /* не JSON — ниже подстроки */ }
+  }
+  // Частые текстовые форматы
+  if (line.includes(`chatId='${chatId}'`) && line.includes(`authorId='${authorId}'`)) return true;
+  if (line.includes(`"chat_id": "${chatId}"`) && (line.includes(`"author_id": "${authorId}"`) || line.includes(`"author_id": ${authorId}`))) return true;
+
+  // fallback: простые key=value
+  const rx = new RegExp(`chat[_ ]?id\\s*[:=]\\s*'?${escapeReg(chatId)}'?.*author[_ ]?id\\s*[:=]\\s*'?${escapeReg(authorId)}'?`, 'i');
+  return rx.test(line);
+}
+function escapeReg(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// ищем подтверждение по двум последним логам (только по chat_id + author_id)
+async function hasConfirmationInTwoLogs(chatId, authorId) {
+  const files = await getTwoLatestLogFiles();
+  if (files.length === 0) return false;
+  for (const f of files) {
+    const tail = await readLogTail(f);
+    const lines = tail.split('\n');
+    if (lines.some(line => isLogMatch(line, chatId, authorId))) return true;
+  }
+  return false;
+}
+
 // ===== APP =====
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -137,9 +196,9 @@ app.get('/tasks/debug', async (req, res) => {
 // ручная постановка (для тестов)
 app.post('/tasks/enqueue', async (req, res) => {
   try {
-    const { account, chat_id, reply_text, message_id } = req.body || {};
+    const { account, chat_id, reply_text, message_id, author_id } = req.body || {};
     if (!chat_id) return bad(res, 400, 'chat_id required');
-    const t = await createTask({ account, chat_id, reply_text, message_id });
+    const t = await createTask({ account, chat_id, reply_text, message_id, author_id });
     res.send({ ok: true, task: t });
   } catch (e) {
     res.status(500).send({ ok: false, error: String(e) });
@@ -150,7 +209,6 @@ app.post('/tasks/enqueue', async (req, res) => {
 
 // простая in-memory защита "только первое системное по чату"
 const seenSystemToday = new Set(); // ключ: `${account}:${chatId}`
-// (обнуляется при рестарте; если нужен персист — можно писать маркер в /mnt/data)
 
 app.post('/webhook/:account', async (req, res) => {
   const account = req.params.account || 'hr-main';
@@ -199,6 +257,7 @@ app.post('/webhook/:account', async (req, res) => {
           chat_id: chatId,
           reply_text: DEFAULT_REPLY,
           message_id: msgId
+          // author_id можно проставить, если знаешь ID своего бота/аккаунта заранее
         });
       }
     }
@@ -207,33 +266,23 @@ app.post('/webhook/:account', async (req, res) => {
   return ok(res);
 });
 
-// ===== Проверка Done по логам (был ли исходящий от нашего author_id в этом чате) =====
+// ===== Проверка Done по логам (два последних лога, только chat_id+author_id) =====
 app.get('/logs/has', async (req, res) => {
   const chat   = String(req.query.chat   || '').trim();
   const author = String(req.query.author || '').trim();
   if (!chat || !author) return bad(res, 400, 'chat & author required');
 
-  await ensureDir(LOG_DIR);
-  let files = (await fsp.readdir(LOG_DIR))
-    .filter(f => f.endsWith('.log'))
-    .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs }))
-    .sort((a, b) => b.t - a.t);
-
-  if (files.length === 0) return ok(res, { exists: false });
-
-  // читаем хвост последнего лога (500 КБ)
-  const latest = path.join(LOG_DIR, files[0].f);
-  let buf = await fsp.readFile(latest, 'utf8');
-  const MAX = 500 * 1024;
-  if (buf.length > MAX) buf = buf.slice(buf.length - MAX);
-
-  const has = buf.includes(`"chat_id": "${chat}"`) && buf.includes(`"author_id": ${author}`);
-  return ok(res, { exists: has, file: files[0].f });
+  try {
+    const exists = await hasConfirmationInTwoLogs(chat, author);
+    return ok(res, { exists });
+  } catch (e) {
+    return res.status(500).send({ ok: false, error: String(e) });
+  }
 });
 
 // ===== Просмотр логов через HTTP =====
 
-// список файлов логов
+// список логов
 app.get('/logs', async (req, res) => {
   try {
     await ensureDir(LOG_DIR);
@@ -258,7 +307,7 @@ app.get('/logs/read', async (req, res) => {
     const exists = fs.existsSync(full);
     if (!exists) return bad(res, 404, 'not found');
 
-    const tail = Number(req.query.tail || 300000); // 300 КБ по умолч.
+    const tail = Number(req.query.tail || LOG_TAIL_BYTES);
     let buf = await fsp.readFile(full, 'utf8');
     if (buf.length > tail) buf = buf.slice(buf.length - tail);
     res.type('text/plain').send(buf);
@@ -267,13 +316,14 @@ app.get('/logs/read', async (req, res) => {
   }
 });
 
-// ===== задачи: claim / done / requeue =====
+// ===== AUTH helper for task endpoints =====
 function checkKey(req, res) {
   const key = String(req.query.key || req.body?.key || '').trim();
   if (!TASK_KEY || key !== TASK_KEY) { bad(res, 403, 'bad key'); return false; }
   return true;
 }
 
+// ===== задачи: claim / done / requeue =====
 app.all('/tasks/claim', async (req, res) => {
   if (!checkKey(req, res)) return;
   const account = String(req.query.account || req.body?.account || '').trim();
@@ -307,6 +357,56 @@ app.post('/tasks/requeue', async (req, res) => {
   return ok(res);
 });
 
+// ===== Новый endpoint: /tasks/doneSafe =====
+// Сервер сам читает .json.taking, достаёт chat_id + author_id и ищет подтверждение в двух последних логах.
+// Если подтверждение найдено — удаляет .json.taking и отвечает 204; если нет — 428 (ничего не удаляет).
+app.post('/tasks/doneSafe', async (req, res) => {
+  if (!checkKey(req, res)) return;
+
+  const lock = String(req.query.lock || req.body?.lock || '').trim();
+  if (!lock || !lock.endsWith('.json.taking')) return bad(res, 400, 'lock invalid');
+
+  const takingPath = path.join(TASK_DIR, lock);
+  if (!fs.existsSync(takingPath)) return bad(res, 404, 'taking not found');
+
+  // читаем .json.taking → chat_id + author_id
+  let chatId = null, authorId = null;
+  try {
+    const raw = await fsp.readFile(takingPath, 'utf8');
+    const task = JSON.parse(raw);
+    chatId   = task?.chat_id ?? null;
+    authorId = task?.author_id ?? task?.account_id ?? null; // иногда author хранится как account_id
+  } catch (e) {
+    return res.status(422).send({ ok: false, error: 'taking parse failed', details: String(e) });
+  }
+
+  if (!chatId || !authorId) {
+    return res.status(422).send({ ok: false, error: 'chat_id and author_id required in taking' });
+  }
+
+  // проверяем два последних лог-файла: ТОЛЬКО chat_id + author_id
+  let confirmed = false;
+  try {
+    confirmed = await hasConfirmationInTwoLogs(String(chatId), String(authorId));
+  } catch (e) {
+    return res.status(500).send({ ok: false, error: 'logs read failed', details: String(e) });
+  }
+
+  if (!confirmed) {
+    // НЕТ подтверждения → 428 и ничего не удаляем
+    return res.status(428).send({ ok: false, confirmed: false });
+  }
+
+  // подтверждение есть → удаляем .json.taking
+  try {
+    await fsp.unlink(takingPath);
+  } catch (e) {
+    return res.status(500).send({ ok: false, error: 'taking delete failed', details: String(e) });
+  }
+
+  return res.status(204).end(); // No Content
+});
+
 // ===== start =====
 (async () => {
   await ensureDir(LOG_DIR);
@@ -315,6 +415,6 @@ app.post('/tasks/requeue', async (req, res) => {
   console.log(`LOG_DIR=${path.resolve(LOG_DIR)}`);
   console.log(`TASK_DIR=${path.resolve(TASK_DIR)}`);
   console.log(`ONLY_FIRST_SYSTEM=${ONLY_FIRST_SYSTEM}`);
-  console.log(`Watching last 3 tasks in claim`);
+  console.log(`LOG_TAIL_BYTES=${LOG_TAIL_BYTES}`);
   app.listen(PORT, () => console.log(`Server on :${PORT}`));
 })();
