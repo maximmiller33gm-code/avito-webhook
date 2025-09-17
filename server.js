@@ -13,7 +13,7 @@ const __dirname  = path.dirname(__filename);
 
 // ===== ENV =====
 const PORT              = Number(process.env.PORT || 3000);
-const TASK_KEY          = String(process.env.TASK_KEY || '').trim();
+const TASK_KEY = "kK9f4JQ7uX2pL0aN"; // твой ключ прямо в коде
 const LOG_DIR           = process.env.LOG_DIR  || '/mnt/data/logs';
 const TASK_DIR          = process.env.TASK_DIR || '/mnt/data/tasks';
 const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
