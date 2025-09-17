@@ -1,276 +1,224 @@
-import express from "express";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import dotenv from "dotenv";
-dotenv.config();
+// server.js — файловая очередь + лог-вебхуков + проверка Done по логам
+const express = require('express');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const PORT = Number(process.env.PORT || 3000);
+const TASK_KEY = (process.env.TASK_KEY || '').trim();
+const LOG_DIR = process.env.LOG_DIR || './logs';
+const TASK_DIR = process.env.TASK_DIR || './tasks';
+const REPLY_DEFAULT = process.env.REPLY_DEFAULT || 'Здравствуйте!';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''; // если задан — проверяем
 
-// === Конфиг из env
-const PORT = process.env.PORT || 8080;
-const TASK_DIR = process.env.TASK_DIR || "/mnt/data/tasks";         // файловая очередь
-const TASK_KEY = process.env.TASK_KEY || "kK9f4JQ7uX2pL0aN";   // ключ для claim/done/requeue
-const DEFAULT_REPLY =
-  process.env.DEFAULT_REPLY ||
-  "Здравствуйте! Спасибо за отклик 🙌 Сейчас пришлю детали и анкету.";
-const ONLY_FIRST_SYSTEM =
-  String(process.env.ONLY_FIRST_SYSTEM || "true").toLowerCase() === "true"; // если true — реагируем только на первое системное «Кандидат откликнулся»
+// ===== утилиты =====
+async function ensureDir(dir) {
+  try { await fsp.mkdir(dir, { recursive: true }); } catch {}
+}
+function nowIso() { return new Date().toISOString(); }
+function todayLogName() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth()+1).padStart(2,'0');
+  const day = String(d.getUTCDate()).padStart(2,'0');
+  return `logs.${y}${m}${day}.log`;
+}
+async function appendLog(text) {
+  await ensureDir(LOG_DIR);
+  const file = path.join(LOG_DIR, todayLogName());
+  await fsp.appendFile(file, text, 'utf8');
+  return file;
+}
+function ok(res, extra={}) { return res.send({ ok:true, ...extra }); }
+function bad(res, code, msg) { return res.status(code).send({ ok:false, error: msg }); }
+function genId() { return crypto.randomBytes(16).toString('hex'); }
 
-fs.mkdirSync(TASK_DIR, { recursive: true });
-
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-// healthcheck
-app.get("/", (_, res) => res.json({ ok: true, msg: "Avito webhook alive 🚀" }));
-
-// ========================= WEBHOOK =========================
-//
-// Принимаем события от Авито: /webhook/:account
-// Кладём задачу в файловую очередь (идемпотентно по messageId)
-// Логируем сырой JSON в консоль для отладки
-//
-app.post("/webhook/:account", (req, res) => {
-  const account = req.params.account || "default";
-
-  // ЛОГ ПОЛНОГО ПЕЙЛОАДА
-  console.log("=== RAW AVITO WEBHOOK ===");
-  try {
-    console.log(JSON.stringify(req.body, null, 2));
-  } catch {
-    console.log("[warn] cannot stringify req.body");
-  }
-  console.log("=========================");
-
-  const body = req.body || {};
-  const payload = body.payload || {};
-  const v = payload.value || {};
-
-  if (payload.type !== "message" || !v) {
-    return res.json({ ok: true, skipped: "not a message event" });
-  }
-
-  const msgType = String(v.type || "").toLowerCase(); // "system" | "text" | ...
-  const textIn = v.content?.text || "";
-  const chatId = String(v.chat_id || "");
-  const messageId = String(v.id || "");
-  const authorId = Number(v.author_id || 0);
-
-  if (!chatId || !messageId) {
-    return res.status(400).json({ ok: false, error: "no chatId/messageId" });
-  }
-
-  // --- Логика триггера задачи ---
-  // По умолчанию реагируем на два случая:
-  // 1) Первое системное сообщение-уведомление об отклике: "[Системное сообщение] Кандидат откликнулся ..."
-  // 2) Любое текстовое сообщение от человека (author_id > 0), если отключён режим ONLY_FIRST_SYSTEM
-  let shouldCreateTask = false;
-
-  const isSystemCandidate =
-    msgType === "system" &&
-    typeof textIn === "string" &&
-    textIn.toLowerCase().includes("кандидат откликнулся");
-
-  if (ONLY_FIRST_SYSTEM) {
-    shouldCreateTask = isSystemCandidate;
-  } else {
-    const isHumanText = authorId > 0 && msgType !== "system";
-    shouldCreateTask = isSystemCandidate || isHumanText;
-  }
-
-  if (!shouldCreateTask) {
-    return res.json({ ok: true, skipped: "filter_no_task" });
-  }
-
-  const task = {
-    account,
-    source: "avito",
-    receivedAt: new Date().toISOString(),
-
-    // привязки
-    messageId,
-    chatId,
-    chatType: String(v.chat_type || ""),
-    itemId: Number(v.item_id || 0),
-    userId: Number(v.user_id || 0),
-    createdTs: Number(v.created || 0),
-    publishedAt: String(v.published_at || ""),
-
-    // содержимое
-    textIn,
-    replyText: DEFAULT_REPLY,
-    chatUrl: null
+// ===== файловая очередь задач =====
+// структура файла задачи (.json):
+// { id, account, chat_id, reply_text, message_id, created_at }
+async function createTask({ account, chat_id, reply_text, message_id }) {
+  await ensureDir(TASK_DIR);
+  const id = genId();
+  const obj = {
+    id, account: account || 'hr-main',
+    chat_id, reply_text: reply_text || REPLY_DEFAULT,
+    message_id: message_id || null,
+    created_at: nowIso(),
   };
+  const file = path.join(TASK_DIR, `${id}.json`);
+  await fsp.writeFile(file, JSON.stringify(obj, null, 2), 'utf8');
+  return obj;
+}
 
-  // ИДЕМПОТЕНТНОЕ СОЗДАНИЕ: создаём *.json, если ещё не существует
-  const filePath = path.join(TASK_DIR, `${messageId}.json`);
-  try {
-    const fd = fs.openSync(filePath, "wx"); // создаст новый файл, если нет
-    fs.writeFileSync(fd, JSON.stringify(task, null, 2), "utf8");
-    fs.closeSync(fd);
-  } catch (e) {
-    if (e?.code === "EEXIST") return res.json({ ok: true, dedup: true });
-    console.error("write task error:", e);
-    return res.status(500).json({ ok: false, error: "write failed" });
-  }
-
-  return res.json({ ok: true });
-});
-
-// ========================= HTTP-ОЧЕРЕДЬ ДЛЯ ZENNO =========================
-//
-// GET /tasks/claim?account=hr-main&key=TASK_KEY
-//   → возвращает ближайшую задачу и ЛОК-файл (rename *.json → *.taking)
-// POST /tasks/done?lock=<имя_лок_файла>&key=TASK_KEY
-//   → подтверждает выполнение, удаляет ЛОК-файл
-// POST /tasks/requeue?lock=<имя_лок_файла>&key=TASK_KEY
-//   → возвращает задачу в очередь (rename *.taking → *.json)
-//
-app.get("/tasks/claim", (req, res) => {
-  if ((req.query.key || "") !== TASK_KEY)
-    return res.status(403).json({ ok: false, error: "forbidden" });
-
-  const wantAccount = (req.query.account || "").trim(); // можно не указывать
-
-  // Берём первый подходящий файл *.json
-  let files;
-  try {
-    files = fs.readdirSync(TASK_DIR).filter((f) => f.endsWith(".json"));
-  } catch (e) {
-    console.error("claim list error:", e);
-    return res.status(500).json({ ok: false, error: "list failed" });
-  }
-
+// claim: берем первый .json, лочим переименованием в .taking
+async function claimTask(account) {
+  await ensureDir(TASK_DIR);
+  const files = (await fsp.readdir(TASK_DIR))
+    .filter(f => f.endsWith('.json'))
+    .sort(); // по имени (примерно FIFO)
   for (const f of files) {
-    const p = path.join(TASK_DIR, f);
+    const full = path.join(TASK_DIR, f);
+    const raw = JSON.parse(await fsp.readFile(full, 'utf8'));
+    if (account && raw.account && String(raw.account) !== String(account)) continue;
+
+    const taking = full.replace(/\.json$/, '.json.taking');
     try {
-      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (wantAccount && raw.account !== wantAccount) continue;
-
-      // атомарно "залочим": переименуем в .taking
-      const lockPath = p + ".taking";
-      fs.renameSync(p, lockPath);
-
-      // отдаём задачу и имя lock-файла
-      return res.json({
-        ok: true,
-        task: raw,
-        lock: path.basename(lockPath)
-      });
+      await fsp.rename(full, taking); // атомарная блокировка
+      const lockId = path.basename(taking);
+      return { task: raw, lockId };
     } catch (e) {
-      console.error("claim parse/lock error:", e);
-      // битый файл — попробуем удалить, чтобы не клинило очередь
-      try { fs.unlinkSync(p); } catch {}
-      continue;
+      // файл могли забрать параллельно — пробуем следующий
+    }
+  }
+  return null;
+}
+
+// done: удаляем .taking
+async function doneTask(lockId) {
+  const file = path.join(TASK_DIR, lockId);
+  try { await fsp.unlink(file); } catch {}
+  return true;
+}
+
+// requeue: возвращаем .taking -> .json
+async function requeueTask(lockId) {
+  const from = path.join(TASK_DIR, lockId);
+  const to = from.replace(/\.json\.taking$/, '.json');
+  try { await fsp.rename(from, to); } catch {}
+  return true;
+}
+
+// ===== express =====
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+// health
+app.get('/', (req, res) => ok(res, { up:true }));
+
+// ===== вебхук от Авито =====
+app.post('/webhook/:account', async (req, res) => {
+  const account = req.params.account || 'hr-main';
+
+  // (опц.) проверка секрета
+  if (WEBHOOK_SECRET) {
+    const headerSecret = req.headers['x-avito-secret'];
+    const bodySecret = req.body && req.body.secret;
+    if (String(headerSecret || bodySecret || '') !== String(WEBHOOK_SECRET)) {
+      return bad(res, 403, 'forbidden');
     }
   }
 
-  return res.json({ ok: true, task: null }); // задач нет
-});
+  // логируем RAW вебхук (как просили)
+  const pretty = JSON.stringify(req.body || {}, null, 2);
+  const header = `=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n`;
+  const footer = `\n=========================\n\n`;
+  await appendLog(header + pretty + footer);
 
-app.post("/tasks/done", (req, res) => {
-  if ((req.query.key || "") !== TASK_KEY)
-    return res.status(403).json({ ok: false, error: "forbidden" });
-
-  const lock = (req.query.lock || "").trim();
-  if (!lock) return res.status(400).json({ ok: false, error: "no lock" });
-
-  const lockPath = path.join(TASK_DIR, lock);
+  // простая логика: если system-отклик — создаём задачу
   try {
-    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("done delete error:", e);
-    return res.status(500).json({ ok: false, error: "delete failed" });
-  }
-});
+    const payload = req.body?.payload || {};
+    const val = payload?.value || {};
+    const isSystem = val?.type === 'system';
+    const txt = val?.content?.text || '';
+    const chatId = val?.chat_id;
+    const msgId = val?.id;
 
-app.post("/tasks/requeue", (req, res) => {
-  if ((req.query.key || "") !== TASK_KEY)
-    return res.status(403).json({ ok: false, error: "forbidden" });
+    // реагируем на "Кандидат откликнулся"
+    const looksLikeCandidate = /Кандидат откликнулся/i.test(txt);
 
-  const lock = (req.query.lock || "").trim();
-  if (!lock) return res.status(400).json({ ok: false, error: "no lock" });
-
-  const lockPath = path.join(TASK_DIR, lock);
-  try {
-    if (!fs.existsSync(lockPath))
-      return res.status(404).json({ ok: false, error: "not found" });
-    const back = lockPath.replace(/\.taking$/, ".json");
-    fs.renameSync(lockPath, back);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("requeue error:", e);
-    return res.status(500).json({ ok: false, error: "requeue failed" });
-  }
-});
-
-// ========================= DEBUG (опционально) =========================
-//
-// Список/чтение/очистка — удобно на старте, потом можно закрыть.
-//
-app.get("/tasks/list", (req, res) => {
-  try {
-    const files = fs
-      .readdirSync(TASK_DIR)
-      .filter((f) => f.endsWith(".json") || f.endsWith(".taking"))
-      .map((f) => {
-        const p = path.join(TASK_DIR, f);
-        const st = fs.statSync(p);
-        return {
-          file: f,
-          size: st.size,
-          mtime: st.mtime.toISOString()
-        };
-      })
-      .sort((a, b) => b.mtime.localeCompare(a.mtime));
-    res.json({ ok: true, dir: TASK_DIR, count: files.length, files });
-  } catch (e) {
-    console.error("list error:", e);
-    res.status(500).json({ ok: false, error: "list failed" });
-  }
-});
-
-app.get("/tasks/read/:id", (req, res) => {
-  const id = (req.params.id || "").trim();
-  if (!id) return res.status(400).json({ ok: false, error: "no id" });
-
-  // поддержим и .json, и .taking для чтения
-  const pJson = path.join(TASK_DIR, `${id}.json`);
-  const pTaking = path.join(TASK_DIR, `${id}.taking`);
-  const filePath = fs.existsSync(pJson) ? pJson : pTaking;
-
-  try {
-    if (!filePath || !fs.existsSync(filePath))
-      return res.status(404).json({ ok: false, error: "not found" });
-    const data = fs.readFileSync(filePath, "utf8");
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.send(data);
-  } catch (e) {
-    console.error("read error:", e);
-    res.status(500).json({ ok: false, error: "read failed" });
-  }
-});
-
-app.post("/tasks/purge", (req, res) => {
-  try {
-    const files = fs
-      .readdirSync(TASK_DIR)
-      .filter((f) => f.endsWith(".json") || f.endsWith(".taking"));
-    let removed = 0;
-    for (const f of files) {
-      try {
-        fs.unlinkSync(path.join(TASK_DIR, f));
-        removed++;
-      } catch {}
+    if (isSystem && looksLikeCandidate && chatId) {
+      await createTask({
+        account,
+        chat_id: chatId,
+        reply_text: REPLY_DEFAULT,
+        message_id: msgId
+      });
     }
-    res.json({ ok: true, removed });
   } catch (e) {
-    console.error("purge error:", e);
-    res.status(500).json({ ok: false, error: "purge failed" });
+    // не блокируем ответ вебхуку
   }
+
+  return ok(res);
 });
 
-app.listen(PORT, () => console.log(`Webhook listening on :${PORT}`));
+// ===== проверка по логам: был ли исходящий с author_id в этом чате =====
+app.get('/logs/has', async (req, res) => {
+  const chat = String(req.query.chat || '').trim();
+  const author = String(req.query.author || '').trim();
+  if (!chat || !author) return bad(res, 400, 'chat & author required');
+
+  await ensureDir(LOG_DIR);
+  const files = (await fsp.readdir(LOG_DIR))
+    .filter(f => f.endsWith('.log'))
+    .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs }))
+    .sort((a,b) => b.t - a.t);
+
+  if (files.length === 0) return ok(res, { exists:false });
+
+  // читаем «хвост» последнего лога (500 КБ)
+  const latest = path.join(LOG_DIR, files[0].f);
+  let buf = await fsp.readFile(latest, 'utf8');
+  const MAX = 500 * 1024;
+  if (buf.length > MAX) buf = buf.slice(buf.length - MAX);
+
+  const has = buf.includes(`"chat_id": "${chat}"`) && buf.includes(`"author_id": ${author}`);
+  return ok(res, { exists: has, file: files[0].f });
+});
+
+// ===== задачи: claim / done / requeue =====
+function checkKey(req, res) {
+  const key = (req.query.key || req.body?.key || '').trim();
+  if (!TASK_KEY || key !== TASK_KEY) {
+    bad(res, 403, 'bad key'); return false;
+  }
+  return true;
+}
+
+// Claim: Zenno спрашивает задачу
+app.all('/tasks/claim', async (req, res) => {
+  if (!checkKey(req, res)) return;
+  const account = (req.query.account || req.body?.account || '').trim();
+
+  const got = await claimTask(account);
+  if (!got) return ok(res, { has:false });
+
+  const { task, lockId } = got;
+  // отдаём то, что ожидает Zenno
+  return ok(res, {
+    has: true,
+    lockId,
+    ChatId: task.chat_id,
+    ReplyText: task.reply_text,
+    MessageId: task.message_id || '',
+    Account: task.account || ''
+  });
+});
+
+// Done: Zenno (или сервер) подтверждает обработку
+app.post('/tasks/done', async (req, res) => {
+  if (!checkKey(req, res)) return;
+  const lock = (req.query.lock || req.body?.lock || '').trim();
+  if (!lock || !lock.endsWith('.json.taking')) return bad(res, 400, 'lock invalid');
+  await doneTask(lock);
+  return ok(res);
+});
+
+// Requeue: вернуть в очередь (если не получилось отправить)
+app.post('/tasks/requeue', async (req, res) => {
+  if (!checkKey(req, res)) return;
+  const lock = (req.query.lock || req.body?.lock || '').trim();
+  if (!lock || !lock.endsWith('.json.taking')) return bad(res, 400, 'lock invalid');
+  await requeueTask(lock);
+  return ok(res);
+});
+
+// ===== старт =====
+(async () => {
+  await ensureDir(LOG_DIR);
+  await ensureDir(TASK_DIR);
+  app.listen(PORT, () => {
+    console.log(`Server on :${PORT}`);
+    console.log(`LOG_DIR=${path.resolve(LOG_DIR)}  TASK_DIR=${path.resolve(TASK_DIR)}`);
+  });
+})();
