@@ -1,4 +1,4 @@
-// ESM-версия: package.json должен содержать "type": "module"
+// server.js — ESM версия (package.json должен содержать: "type": "module")
 import express from 'express';
 import fs from 'fs';
 import { promises as fsp } from 'fs';
@@ -7,19 +7,20 @@ import crypto from 'crypto';
 import process from 'process';
 import { fileURLToPath } from 'url';
 
+// __dirname в ESM
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-// ==== ENV ====
-const PORT = Number(process.env.PORT || 3000);
-const TASK_KEY = String(process.env.TASK_KEY || '').trim();
-const LOG_DIR  = process.env.LOG_DIR  || '/mnt/data/logs';
-const TASK_DIR = process.env.TASK_DIR || '/mnt/data/tasks';
-const DEFAULT_REPLY = process.env.DEFAULT_REPLY || 'Здравствуйте!';
+// ===== ENV =====
+const PORT              = Number(process.env.PORT || 3000);
+const TASK_KEY          = String(process.env.TASK_KEY || '').trim();
+const LOG_DIR           = process.env.LOG_DIR  || '/mnt/data/logs';
+const TASK_DIR          = process.env.TASK_DIR || '/mnt/data/tasks';
+const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
 const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '';
 
-// ==== utils ====
+// ===== helpers =====
 async function ensureDir(dir) { try { await fsp.mkdir(dir, { recursive: true }); } catch {} }
 function nowIso() { return new Date().toISOString(); }
 function genId() { return crypto.randomBytes(16).toString('hex'); }
@@ -27,26 +28,32 @@ function genId() { return crypto.randomBytes(16).toString('hex'); }
 function todayLogName() {
   const d = new Date();
   const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth()+1).padStart(2,'0');
-  const day = String(d.getUTCDate()).padStart(2,'0');
-  return `logs.${y}${m}${day}.log`;
+  const m = String(d.getUTCMonth()+1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `logs.${y}${m}${dd}.log`;
 }
+
+// дублируем лог и в файл, и в консоль
 async function appendLog(text) {
+  console.log(text); // видно в Deploy Logs
   await ensureDir(LOG_DIR);
   const file = path.join(LOG_DIR, todayLogName());
-  await fsp.appendFile(file, text, 'utf8');
+  await fsp.appendFile(file, text + '\n', 'utf8');
   return file;
 }
+
 function ok(res, extra = {}) { return res.send({ ok: true, ...extra }); }
 function bad(res, code, msg) { return res.status(code).send({ ok: false, error: msg }); }
 
-// ==== FILE QUEUE ====
-// Файл задачи: { id, account, chat_id, reply_text, message_id, created_at }
+// ===== FILE QUEUE =====
+// файл задачи: { id, account, chat_id, reply_text, message_id, created_at }
+
 async function createTask({ account, chat_id, reply_text, message_id }) {
   await ensureDir(TASK_DIR);
-  const id = genId();
+  const id  = genId();
   const acc = (account || 'hr-main').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const obj = {
+
+  const task = {
     id,
     account: acc,
     chat_id,
@@ -54,24 +61,25 @@ async function createTask({ account, chat_id, reply_text, message_id }) {
     message_id: message_id || null,
     created_at: nowIso(),
   };
+
   const file = path.join(TASK_DIR, `${acc}__${id}.json`);
-  await fsp.writeFile(file, JSON.stringify(obj, null, 2), 'utf8');
-  return obj;
+  await fsp.writeFile(file, JSON.stringify(task, null, 2), 'utf8');
+  return task;
 }
 
-// Claim: смотреть только ПОСЛЕДНИЕ 3 json-файла (по mtime)
+// Claim: смотрим только последние 3 json по mtime (и, если задан account, фильтруем по префиксу)
 async function claimTask(account) {
   await ensureDir(TASK_DIR);
   let files = (await fsp.readdir(TASK_DIR)).filter(f => f.endsWith('.json'));
 
-  // сортируем по времени изменения: новые впереди
+  // сортировка по дате изменения: новые вперёд
   files.sort((a, b) => {
     const ta = fs.statSync(path.join(TASK_DIR, a)).mtimeMs;
     const tb = fs.statSync(path.join(TASK_DIR, b)).mtimeMs;
     return tb - ta;
   });
 
-  // фильтруем по account префиксу (если задан)
+  // фильтр по account
   if (account) {
     const pref = `${account}__`;
     files = files.filter(f => f.startsWith(pref));
@@ -81,15 +89,15 @@ async function claimTask(account) {
   files = files.slice(0, 3);
 
   for (const f of files) {
-    const full = path.join(TASK_DIR, f);
+    const full   = path.join(TASK_DIR, f);
     const taking = full.replace(/\.json$/, '.json.taking');
     try {
-      await fsp.rename(full, taking); // атомарная блокировка
+      await fsp.rename(full, taking); // атомарная блокировка файла
       const raw = JSON.parse(await fsp.readFile(taking, 'utf8'));
       const lockId = path.basename(taking);
       return { task: raw, lockId };
     } catch {
-      // файл могли увести параллельно — пробуем следующий
+      // файл могли забрать параллельно — пробуем следующий
     }
   }
   return null;
@@ -100,21 +108,22 @@ async function doneTask(lockId) {
   try { await fsp.unlink(file); } catch {}
   return true;
 }
+
 async function requeueTask(lockId) {
   const from = path.join(TASK_DIR, lockId);
-  const to = from.replace(/\.json\.taking$/, '.json');
+  const to   = from.replace(/\.json\.taking$/, '.json');
   try { await fsp.rename(from, to); } catch {}
   return true;
 }
 
-// ==== APP ====
+// ===== APP =====
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 // health
 app.get('/', (req, res) => ok(res, { up: true }));
 
-// debug — посмотреть, что лежит в TASK_DIR
+// debug: список файлов в TASK_DIR
 app.get('/tasks/debug', async (req, res) => {
   try {
     await ensureDir(TASK_DIR);
@@ -125,7 +134,7 @@ app.get('/tasks/debug', async (req, res) => {
   }
 });
 
-// ручная постановка в очередь (для теста)
+// ручная постановка (для тестов)
 app.post('/tasks/enqueue', async (req, res) => {
   try {
     const { account, chat_id, reply_text, message_id } = req.body || {};
@@ -137,14 +146,19 @@ app.post('/tasks/enqueue', async (req, res) => {
   }
 });
 
-// ===== ВЕБХУК ОТ АВИТО =====
+// ===== ВЕБХУК АВИТО =====
+
+// простая in-memory защита "только первое системное по чату"
+const seenSystemToday = new Set(); // ключ: `${account}:${chatId}`
+// (обнуляется при рестарте; если нужен персист — можно писать маркер в /mnt/data)
+
 app.post('/webhook/:account', async (req, res) => {
   const account = req.params.account || 'hr-main';
 
-  // (опц.) секрет
+  // (опц.) проверка секрета
   if (WEBHOOK_SECRET) {
     const headerSecret = req.headers['x-avito-secret'];
-    const bodySecret = req.body && req.body.secret;
+    const bodySecret   = req.body && req.body.secret;
     if (String(headerSecret || bodySecret || '') !== String(WEBHOOK_SECRET)) {
       return bad(res, 403, 'forbidden');
     }
@@ -153,40 +167,49 @@ app.post('/webhook/:account', async (req, res) => {
   // лог RAW
   const pretty = JSON.stringify(req.body || {}, null, 2);
   const header = `=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n`;
-  const footer = `\n=========================\n\n`;
+  const footer = `\n=========================\n`;
   await appendLog(header + pretty + footer);
 
-  // простая логика: «Кандидат откликнулся» => ставим задачу
+  // простая логика создания задачи на отклик
   try {
     const payload = req.body?.payload || {};
-    const val = payload?.value || {};
+    const val     = payload?.value || {};
     const isSystem = val?.type === 'system';
-    const txt = String(val?.content?.text || '');
-    const chatId = val?.chat_id;
-    const msgId = val?.id;
+    const txt     = String(val?.content?.text || '');
+    const chatId  = val?.chat_id;
+    const msgId   = val?.id;
 
-    // фильтр: только первое системное по чату (если включен ONLY_FIRST_SYSTEM)
-    let pass = /Кандидат/i.test(txt) || /отклик/i.test(txt);
-    if (isSystem && pass && chatId) {
+    const looksLikeCandidate = /кандидат|отклик/i.test(txt);
+
+    if (isSystem && looksLikeCandidate && chatId) {
+      let allowed = true;
+
       if (ONLY_FIRST_SYSTEM) {
-        // проверим в логах, было ли раньше системное для этого чата сегодня (очень грубо)
-        // если нужно строго — можно вести small in-memory set
+        const key = `${account}:${chatId}`;
+        if (seenSystemToday.has(key)) {
+          allowed = false;
+        } else {
+          seenSystemToday.add(key);
+        }
       }
-      await createTask({
-        account,
-        chat_id: chatId,
-        reply_text: DEFAULT_REPLY,
-        message_id: msgId
-      });
+
+      if (allowed) {
+        await createTask({
+          account,
+          chat_id: chatId,
+          reply_text: DEFAULT_REPLY,
+          message_id: msgId
+        });
+      }
     }
-  } catch {}
+  } catch {/* игнорим, вебхуку всегда отвечаем 200 */}
 
   return ok(res);
 });
 
-// ===== Проверка Done по логам =====
+// ===== Проверка Done по логам (был ли исходящий от нашего author_id в этом чате) =====
 app.get('/logs/has', async (req, res) => {
-  const chat = String(req.query.chat || '').trim();
+  const chat   = String(req.query.chat   || '').trim();
   const author = String(req.query.author || '').trim();
   if (!chat || !author) return bad(res, 400, 'chat & author required');
 
@@ -194,11 +217,11 @@ app.get('/logs/has', async (req, res) => {
   let files = (await fsp.readdir(LOG_DIR))
     .filter(f => f.endsWith('.log'))
     .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs }))
-    .sort((a,b) => b.t - a.t);
+    .sort((a, b) => b.t - a.t);
 
   if (files.length === 0) return ok(res, { exists: false });
 
-  // читаем хвост последнего (500 КБ)
+  // читаем хвост последнего лога (500 КБ)
   const latest = path.join(LOG_DIR, files[0].f);
   let buf = await fsp.readFile(latest, 'utf8');
   const MAX = 500 * 1024;
@@ -206,6 +229,42 @@ app.get('/logs/has', async (req, res) => {
 
   const has = buf.includes(`"chat_id": "${chat}"`) && buf.includes(`"author_id": ${author}`);
   return ok(res, { exists: has, file: files[0].f });
+});
+
+// ===== Просмотр логов через HTTP =====
+
+// список файлов логов
+app.get('/logs', async (req, res) => {
+  try {
+    await ensureDir(LOG_DIR);
+    const files = (await fsp.readdir(LOG_DIR))
+      .filter(f => f.endsWith('.log'))
+      .map(f => ({ name: f, mtime: fs.statSync(path.join(LOG_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+
+    res.send({ ok: true, files });
+  } catch (e) {
+    res.status(500).send({ ok: false, error: String(e) });
+  }
+});
+
+// прочитать лог-файл (полностью или хвостом)
+// пример: GET /logs/read?file=logs.20250917.log&tail=100000
+app.get('/logs/read', async (req, res) => {
+  try {
+    const file = String(req.query.file || '').trim();
+    if (!file || !/^[\w.\-]+$/.test(file)) return bad(res, 400, 'bad file');
+    const full = path.join(LOG_DIR, file);
+    const exists = fs.existsSync(full);
+    if (!exists) return bad(res, 404, 'not found');
+
+    const tail = Number(req.query.tail || 300000); // 300 КБ по умолч.
+    let buf = await fsp.readFile(full, 'utf8');
+    if (buf.length > tail) buf = buf.slice(buf.length - tail);
+    res.type('text/plain').send(buf);
+  } catch (e) {
+    res.status(500).send({ ok: false, error: String(e) });
+  }
 });
 
 // ===== задачи: claim / done / requeue =====
@@ -248,12 +307,11 @@ app.post('/tasks/requeue', async (req, res) => {
   return ok(res);
 });
 
-// ==== start ====
+// ===== start =====
 (async () => {
   await ensureDir(LOG_DIR);
   await ensureDir(TASK_DIR);
-  const appRoot = path.resolve(__dirname);
-  console.log(`App root: ${appRoot}`);
+  console.log(`App root: ${path.resolve(__dirname)}`);
   console.log(`LOG_DIR=${path.resolve(LOG_DIR)}`);
   console.log(`TASK_DIR=${path.resolve(TASK_DIR)}`);
   console.log(`ONLY_FIRST_SYSTEM=${ONLY_FIRST_SYSTEM}`);
