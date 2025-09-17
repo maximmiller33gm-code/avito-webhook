@@ -1,4 +1,4 @@
-// server.js — ESM (в package.json: { "type": "module" })
+// server.js — ESM (package.json: { "type": "module" })
 import express from 'express';
 import fs from 'fs';
 import { promises as fsp } from 'fs';
@@ -19,7 +19,7 @@ const TASK_DIR          = process.env.TASK_DIR || '/mnt/data/tasks';
 const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
 const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
 const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '';
-const LOG_TAIL_BYTES    = Number(process.env.LOG_TAIL_BYTES || 512 * 1024); // 512KB из хвоста
+const LOG_TAIL_BYTES    = Number(process.env.LOG_TAIL_BYTES || 512 * 1024); // 512 KB хвоста
 
 // ===== helpers =====
 async function ensureDir(dir) { try { await fsp.mkdir(dir, { recursive: true }); } catch {} }
@@ -46,7 +46,7 @@ function ok(res, extra = {}) { return res.send({ ok: true, ...extra }); }
 function bad(res, code, msg) { return res.status(code).send({ ok: false, error: msg }); }
 
 // ===== FILE QUEUE =====
-// структура задачи: { id, account, chat_id, reply_text, [author_id], [message_id], created_at }
+// задача: { id, account, chat_id, reply_text, [author_id], [message_id], created_at }
 async function createTask({ account, chat_id, reply_text, message_id, author_id }) {
   await ensureDir(TASK_DIR);
   const id  = genId();
@@ -58,7 +58,7 @@ async function createTask({ account, chat_id, reply_text, message_id, author_id 
     chat_id,
     reply_text: reply_text || DEFAULT_REPLY,
     message_id: message_id || null,
-    author_id: author_id || null, // если знаешь ID своего отправителя — можно проставить
+    author_id: author_id || null, // если знаешь — заполняй сразу
     created_at: nowIso(),
   };
 
@@ -67,7 +67,6 @@ async function createTask({ account, chat_id, reply_text, message_id, author_id 
   return task;
 }
 
-// Claim: берём до 3 свежих по mtime (опц. фильтр по account)
 async function claimTask(account) {
   await ensureDir(TASK_DIR);
   let files = (await fsp.readdir(TASK_DIR)).filter(f => f.endsWith('.json'));
@@ -94,7 +93,7 @@ async function claimTask(account) {
       const lockId = path.basename(taking);
       return { task: raw, lockId };
     } catch {
-      // могли перехватить параллельно
+      // перехватили параллельно — идём дальше
     }
   }
   return null;
@@ -114,6 +113,8 @@ async function requeueTask(lockId) {
 }
 
 // ===== LOG HELPERS =====
+
+// список двух последних лог-файлов
 async function getTwoLatestLogFiles() {
   await ensureDir(LOG_DIR);
   const files = (await fsp.readdir(LOG_DIR))
@@ -131,57 +132,58 @@ async function readLogTail(file, maxBytes = LOG_TAIL_BYTES) {
   return buf;
 }
 
-function escapeReg(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-// Построчная эвристика (на случай, если лог — одна JSON-строка)
-function isLogMatch(line, chatId, authorId) {
-  if (line && (line[0] === '{' || line[0] === '[')) {
-    try {
-      const obj = JSON.parse(line);
-      if (obj && typeof obj === 'object') {
-        const lChat = obj.chat_id ?? obj.chatId ?? obj.chat ?? null;
-        const lAuth = obj.author_id ?? obj.authorId ?? obj.author ?? null;
-        if (lChat != null && lAuth != null) {
-          return String(lChat) === String(chatId) && String(lAuth) === String(authorId);
-        }
-      }
-    } catch { /* не JSON */ }
-  }
-  if (line.includes(`chatId='${chatId}'`) && line.includes(`authorId='${authorId}'`)) return true;
-  if (line.includes(`"chat_id": "${chatId}"`) && (line.includes(`"author_id": ${authorId}`) || line.includes(`"author_id": "${authorId}"`))) return true;
-
-  const rx = new RegExp(`chat[_ ]?id\\s*[:=]\\s*'?${escapeReg(chatId)}'?.*author[_ ]?id\\s*[:=]\\s*'?${escapeReg(authorId)}'?`, 'i');
-  return rx.test(line);
+// разрезаем хвост на блоки вебхуков
+function splitWebhookBlocks(tail) {
+  return tail
+    .split(/=== RAW AVITO WEBHOOK .*? ===\n/i)
+    .slice(1)
+    .map(s => (s.split(/\n=========================\n/)[0] || "").trim())
+    .filter(Boolean);
 }
 
-// ✅ ИЩЕМ ВО ВСЁМ ХВОСТЕ: chat_id + author_id могут быть в разных строках одного блока
-function tailContainsPair(tail, chatId, authorId) {
-  const chatNeedle = `"chat_id": "${chatId}"`;
-  const authNeedle1 = `"author_id": ${authorId}`;      // author числом
-  const authNeedle2 = `"author_id": "${authorId}"`;    // author строкой
-  return tail.includes(chatNeedle) && (tail.includes(authNeedle1) || tail.includes(authNeedle2));
+// безошибочный парсер блока (pretty JSON)
+function parseWebhookBlock(block) {
+  try { return JSON.parse(block); } catch { return null; }
 }
 
-// ✅ Главная функция: смотрим ДВА последних лог-файла
-async function hasConfirmationInTwoLogs(chatId, authorId) {
+// epoch из "timestamp" (сек)
+function extractEpochFromBlock(block) {
+  const obj = parseWebhookBlock(block);
+  let t = obj?.timestamp;
+  if (typeof t === "number") return Math.floor(t > 1e12 ? t/1000 : t);
+  const m = block.match(/"timestamp"\s*:\s*(\d{10,13})/);
+  if (!m) return null;
+  t = Number(m[1]);
+  return Math.floor(t > 1e12 ? t/1000 : t);
+}
+
+// этот блок — наш подтверждающий «ответ» (второй тип): text, тот же chat_id и наш author_id
+function blockIsReplyFromAuthor(block, chatId, authorId) {
+  const obj = parseWebhookBlock(block);
+  const v = obj?.payload?.value;
+  if (!v) return false;
+
+  const sameChat = String(v.chat_id) === String(chatId);
+  const sameAuthor = String(v.author_id) === String(authorId);
+  const isText = String(v.type).toLowerCase() === "text";
+
+  // system (author_id=0, type=system) игнорим
+  return sameChat && sameAuthor && isText;
+}
+
+// подтверждение ищем ТОЛЬКО в двух последних логах, ТОЛЬКО в reply-блоках, ПОСЛЕ времени захвата
+async function hasReplyAfterEpoch(chatId, authorId, notBeforeEpoch) {
   const files = await getTwoLatestLogFiles();
   if (files.length === 0) return false;
 
   for (const f of files) {
-    const tail = await readLogTail(f);
+    let tail = await readLogTail(f);
+    const blocks = splitWebhookBlocks(tail);
 
-    // A) быстрый поиск по всему хвосту (многострочный JSON-блок)
-    if (tailContainsPair(tail, chatId, authorId)) return true;
-
-    // B) запасной вариант — построчная проверка (когда лог — «JSON-в-строку»)
-    const lines = tail.split('\n');
-    if (lines.some(line => isLogMatch(line, chatId, authorId))) return true;
-
-    // C) узкое «окно» вокруг chat_id — если author_id рядом
-    const idx = tail.indexOf(`"chat_id": "${chatId}"`);
-    if (idx >= 0) {
-      const win = tail.slice(Math.max(0, idx - 2000), Math.min(tail.length, idx + 2000));
-      if (win.includes(`"author_id": ${authorId}`) || win.includes(`"author_id": "${authorId}"`)) return true;
+    for (const b of blocks) {
+      const ts = extractEpochFromBlock(b);
+      if (ts == null || ts < notBeforeEpoch) continue;         // должно быть позже захвата
+      if (blockIsReplyFromAuthor(b, chatId, authorId)) return true;
     }
   }
   return false;
@@ -194,7 +196,7 @@ app.use(express.json({ limit: '1mb' }));
 // health
 app.get('/', (req, res) => ok(res, { up: true }));
 
-// debug: список файлов в TASK_DIR
+// debug: список файлов задач
 app.get('/tasks/debug', async (req, res) => {
   try {
     await ensureDir(TASK_DIR);
@@ -205,7 +207,7 @@ app.get('/tasks/debug', async (req, res) => {
   }
 });
 
-// ручная постановка задачи (для тестов)
+// ручная постановка (для теста)
 app.post('/tasks/enqueue', async (req, res) => {
   try {
     const { account, chat_id, reply_text, message_id, author_id } = req.body || {};
@@ -223,6 +225,7 @@ const seenSystemToday = new Set(); // ключ: `${account}:${chatId}`
 app.post('/webhook/:account', async (req, res) => {
   const account = req.params.account || 'hr-main';
 
+  // (опц.) секрет вебхука
   if (WEBHOOK_SECRET) {
     const headerSecret = req.headers['x-avito-secret'];
     const bodySecret   = req.body && req.body.secret;
@@ -231,11 +234,13 @@ app.post('/webhook/:account', async (req, res) => {
     }
   }
 
+  // логируем полный блок
   const pretty = JSON.stringify(req.body || {}, null, 2);
   const header = `=== RAW AVITO WEBHOOK (${account}) @ ${nowIso()} ===\n`;
   const footer = `\n=========================\n`;
   await appendLog(header + pretty + footer);
 
+  // простая логика постановки задачи по system-событию «кандидат откликнулся»
   try {
     const payload = req.body?.payload || {};
     const val     = payload?.value || {};
@@ -261,29 +266,16 @@ app.post('/webhook/:account', async (req, res) => {
           chat_id: chatId,
           reply_text: DEFAULT_REPLY,
           message_id: msgId
-          // author_id можно проставить заранее, если знаешь ID отправителя
+          // author_id можно проставить заранее
         });
       }
     }
-  } catch { /* игнорируем, вебхуку отвечаем 200 */ }
+  } catch { /* игнорим, вебхуку всегда 200 */ }
 
   return ok(res);
 });
 
-// ===== /logs/has — ищем подтверждение в двух последних логах =====
-app.get('/logs/has', async (req, res) => {
-  const chat   = String(req.query.chat   || '').trim();
-  const author = String(req.query.author || '').trim();
-  if (!chat || !author) return bad(res, 400, 'chat & author required');
-  try {
-    const exists = await hasConfirmationInTwoLogs(chat, author);
-    return ok(res, { exists });
-  } catch (e) {
-    return res.status(500).send({ ok: false, error: String(e) });
-  }
-});
-
-// ===== Просмотр логов =====
+// просмотр логов
 app.get('/logs', async (req, res) => {
   try {
     await ensureDir(LOG_DIR);
@@ -320,7 +312,7 @@ function checkKey(req, res) {
   return true;
 }
 
-// ===== задачи: claim / done / requeue / doneSafe =====
+// ===== tasks: claim / done / requeue / doneSafe =====
 app.all('/tasks/claim', async (req, res) => {
   if (!checkKey(req, res)) return;
   const account = String(req.query.account || req.body?.account || '').trim();
@@ -354,10 +346,10 @@ app.post('/tasks/requeue', async (req, res) => {
   return ok(res);
 });
 
-// ===== Новый: /tasks/doneSafe =====
-// Принимает key, lock, а также (рекомендуется) chat и author.
-// Сверяет chat из запроса с chat_id в taking. Ищет подтверждение по паре (chat, author) в двух последних логах.
-// Если найдено — удаляет .json.taking и отвечает 204; если нет — 428 (ничего не удаляет).
+// ===== СТРОГИЙ /tasks/doneSafe =====
+// Требует: key, lock, chat, author.
+// Сверяет chat с taking. Ищет ПОСЛЕ mtime(taking) в 2 последних логах блок type="text" + тот же chat_id + author_id.
+// Нашёл → удаляет .json.taking и 204; иначе 428 (ничего не удаляет).
 app.post('/tasks/doneSafe', async (req, res) => {
   if (!checkKey(req, res)) return;
 
@@ -366,43 +358,40 @@ app.post('/tasks/doneSafe', async (req, res) => {
   const authQ = req.query.author != null ? String(req.query.author).trim() : null;
 
   if (!lock || !lock.endsWith('.json.taking')) return bad(res, 400, 'lock invalid');
+  if (!chatQ || !authQ) return res.status(422).send({ ok:false, error:'chat & author required in query' });
 
   const takingPath = path.join(TASK_DIR, lock);
   if (!fs.existsSync(takingPath)) return bad(res, 404, 'taking not found');
 
-  let chatFromTaking = null, authorFromTaking = null;
+  // chat_id из taking + время захвата
+  let chatFromTaking = null;
+  const notBeforeEpoch = Math.floor(fs.statSync(takingPath).mtimeMs / 1000);
+
   try {
     const raw  = await fsp.readFile(takingPath, 'utf8');
     const task = JSON.parse(raw);
-    chatFromTaking   = task?.chat_id ?? null;
-    authorFromTaking = (task?.author_id ?? task?.account_id ?? null);
+    chatFromTaking = task?.chat_id ?? null;
   } catch (e) {
     return res.status(422).send({ ok:false, error:'taking parse failed', details:String(e) });
   }
 
-  // 1) chat обязателен: либо в taking, либо в query (и они должны совпасть)
-  const chatId = chatFromTaking ?? chatQ;
-  if (!chatId) return res.status(422).send({ ok:false, error:'chat_id required (taking or query)' });
-
-  if (chatQ && chatQ !== chatId) {
-    return res.status(409).send({ ok:false, error:'chat mismatch', taking_chat: chatId, query_chat: chatQ });
+  if (!chatFromTaking) return res.status(422).send({ ok:false, error:'chat_id missing in taking' });
+  if (chatFromTaking !== chatQ) {
+    return res.status(409).send({ ok:false, error:'chat mismatch', taking_chat: chatFromTaking, query_chat: chatQ });
   }
 
-  // 2) author обязателен: берём из taking, если нет — из query
-  const authorId = (authorFromTaking != null ? String(authorFromTaking) : null) || authQ;
-  if (!authorId) return res.status(422).send({ ok:false, error:'author_id required (taking or query)' });
-
-  // 3) Ищем подтверждение chat+author в двух последних логах
+  // ищем только "второй" блок — реальный ответ
   let confirmed = false;
   try {
-    confirmed = await hasConfirmationInTwoLogs(String(chatId), String(authorId));
+    confirmed = await hasReplyAfterEpoch(chatQ, authQ, notBeforeEpoch);
   } catch (e) {
     return res.status(500).send({ ok:false, error:'logs read failed', details:String(e) });
   }
 
-  if (!confirmed) return res.status(428).send({ ok:false, confirmed:false });
+  if (!confirmed) {
+    return res.status(428).send({ ok:false, confirmed:false });
+  }
 
-  // 4) Удаляем .json.taking — ЗАКРЫТО
   try { await fsp.unlink(takingPath); }
   catch (e) { return res.status(500).send({ ok:false, error:'taking delete failed', details:String(e) }); }
 
@@ -413,10 +402,10 @@ app.post('/tasks/doneSafe', async (req, res) => {
 (async () => {
   await ensureDir(LOG_DIR);
   await ensureDir(TASK_DIR);
-  console.log(`App root: ${path.resolve(__dirname)}`);
   console.log(`LOG_DIR=${path.resolve(LOG_DIR)}`);
   console.log(`TASK_DIR=${path.resolve(TASK_DIR)}`);
   console.log(`ONLY_FIRST_SYSTEM=${ONLY_FIRST_SYSTEM}`);
   console.log(`LOG_TAIL_BYTES=${LOG_TAIL_BYTES}`);
-  app.listen(PORT, () => console.log(`Server on :${PORT}`));
+  const appInstance = app.listen(PORT, () => console.log(`Server on :${PORT}`));
+  appInstance.setTimeout?.(120000); // 120s
 })();
