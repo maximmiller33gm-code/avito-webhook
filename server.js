@@ -16,7 +16,7 @@ const PORT              = Number(process.env.PORT || 3000);
 const TASK_KEY          = process.env.TASK_KEY || 'kK9f4JQ7uX2pL0aN';
 const LOG_DIR           = process.env.LOG_DIR  || '/mnt/data/logs';
 const TASK_DIR          = process.env.TASK_DIR || '/mnt/data/tasks';
-const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте!';
+const DEFAULT_REPLY     = process.env.DEFAULT_REPLY || 'Здравствуйте';
 const ONLY_FIRST_SYSTEM = String(process.env.ONLY_FIRST_SYSTEM || 'true').toLowerCase() === 'true';
 const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET || '';
 const LOG_TAIL_BYTES    = Number(process.env.LOG_TAIL_BYTES || 512 * 1024); // 512 KB хвоста
