@@ -82,7 +82,7 @@ async function claimTask(account) {
     files = files.filter(f => f.startsWith(pref));
   }
 
-  files = files.slice(0, 3);
+  files = files.slice(0, 10);
 
   for (const f of files) {
     const full   = path.join(TASK_DIR, f);
